@@ -33,8 +33,51 @@ services:
     volumes:
       - ./docker/grafana/datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml
       - ./docker/grafana/providers.yml:/etc/grafana/provisioning/dashboards/providers.yml
-      - ./docker/grafana/postgresql-benchmark-load.json:/var/lib/grafana/dashboards/postgresql-benchmark-load.json
-      - ./docker/grafana/postgresql-benchmark-query.json:/var/lib/grafana/dashboards/postgresql-benchmark-query.json
+      - ./docker/grafana/ferretdb-citus-bench.json:/var/lib/grafana/dashboards/ferretdb-citus-bench.json
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=admin
       - GF_USERS_ALLOW_SIGN_UP=false
+
+  master:
+    container_name: "${COMPOSE_PROJECT_NAME:-citus}_master"
+    image: "citusdata/citus:12.0.0"
+    ports: ["${COORDINATOR_EXTERNAL_PORT:-5432}:5432"]
+    labels: ["com.citusdata.role=Master"]
+    environment: &AUTH
+      POSTGRES_USER: "${POSTGRES_USER:-postgres}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD}"
+      PGUSER: "${POSTGRES_USER:-postgres}"
+      PGPASSWORD: "${POSTGRES_PASSWORD}"
+      POSTGRES_HOST_AUTH_METHOD: "${POSTGRES_HOST_AUTH_METHOD:-trust}"
+
+  worker:
+    image: "citusdata/citus:12.0.0"
+    deploy:
+      mode: replicated
+      replicas: 2
+    labels: ["com.citusdata.role=Worker"]
+    depends_on: [manager]
+    environment: *AUTH
+    command: "/wait-for-manager.sh"
+    volumes:
+      - healthcheck-volume:/healthcheck
+
+  manager:
+    container_name: "${COMPOSE_PROJECT_NAME:-citus}_manager"
+    image: "citusdata/membership-manager:0.3.0"
+    volumes:
+      - "${DOCKER_SOCK:-/var/run/docker.sock}:/var/run/docker.sock"
+      - healthcheck-volume:/healthcheck
+    depends_on: [master]
+    environment: *AUTH
+
+  ferretdb:
+    image: ghcr.io/ferretdb/ferretdb
+    restart: on-failure
+    ports:
+      - 27017:27017
+    depends_on: [master]
+    environment:
+      - FERRETDB_POSTGRESQL_URL=postgres://${COMPOSE_PROJECT_NAME:-citus}_master:5432/postgres
+volumes:
+  healthcheck-volume:

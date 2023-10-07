@@ -1,16 +1,18 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"embed"
 	"fmt"
 	"log"
 	"math/rand"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/pkg/errors"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
 //go:embed data
@@ -29,44 +31,34 @@ func main() {
 		return
 	}
 
-	db, err := sql.Open("postgres", os.Getenv("DBCONN"))
+	db, err := sql.Open("postgres", os.Getenv("PG_DBCONN"))
 	if err != nil {
 		log.Print(errors.Wrap(err, "fail to connect to db"))
 		return
 	}
 
+	opts := options.Client().ApplyURI(os.Getenv("MONGO_DBCONN"))
+	client, err := mongo.Connect(context.TODO(), opts)
+	if err != nil {
+		panic(err)
+	}
+
+	defer func() {
+		if err = client.Disconnect(context.TODO()); err != nil {
+			panic(err)
+		}
+	}()
+
 	switch os.Args[1] {
 	case "insert":
-		if len(os.Args) < 3 {
-			log.Print("missing arg, with tables that will be used")
-			return
+		dist := false
+		if len(os.Args) == 3 {
+			if os.Args[2] == "dist" {
+				dist = true
+			}
 		}
 
-		err := insert(db, strings.Split(os.Args[2], ",")...)
-		if err != nil {
-			log.Print(err)
-		}
-	case "query":
-		if len(os.Args) < 3 {
-			log.Print("missing arg, command query requires the query name as a parameter")
-			return
-		}
-		if len(os.Args) < 4 {
-			log.Print("missing arg, with tables that will be used")
-			return
-		}
-
-		err := query(db, os.Args[2], strings.Split(os.Args[3], ",")...)
-		if err != nil {
-			log.Print(err)
-		}
-	case "sizelimit":
-		err := sizelimit(db)
-		if err != nil {
-			log.Print(err)
-		}
-	case "toast":
-		err := testtoast(db)
+		err := insert(client, db, dist)
 		if err != nil {
 			log.Print(err)
 		}

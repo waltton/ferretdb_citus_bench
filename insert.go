@@ -1,15 +1,15 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"strconv"
 	"strings"
 	"time"
 
 	_ "github.com/lib/pq"
-	"golang.org/x/exp/slices"
+	"go.mongodb.org/mongo-driver/mongo"
 
 	"github.com/pkg/errors"
 
@@ -17,13 +17,17 @@ import (
 	"github.com/prometheus/client_golang/prometheus/push"
 )
 
-var batch = 250
+var batch = 25
+var batches = 20   // how many batches will be inserted per iteration
+var iterations = 5 // how many times the whole process will run, setting up a table from scratch and inserting data
 
-func insert(db *sql.DB, tbls ...string) (err error) {
-	_, dataRaw, _, err := loadJsonDataFromDisk()
+func insert(client *mongo.Client, db *sql.DB, dist bool) (err error) {
+	_, _, _, dataArrAny, err := loadJsonDataFromDisk()
 	if err != nil {
 		return err
 	}
+
+	dataArrAny = dataArrAny[:batch*batches]
 
 	pIterations := prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "iterations",
@@ -40,7 +44,6 @@ func insert(db *sql.DB, tbls ...string) (err error) {
 		Help: "Time that the run finished at",
 	})
 
-	iterations := 15
 	pIterations.Set(float64(iterations))
 
 	pBatchSize.Set(float64(batch))
@@ -49,57 +52,20 @@ func insert(db *sql.DB, tbls ...string) (err error) {
 	p.Collector(pIterations)
 	p.Collector(pBatchSize)
 
-	var fieldTypes []string
-	for fieldType := range queryTmpls {
-		if slices.Contains(tbls, fieldType) {
-			fieldTypes = append(fieldTypes, fieldType)
-		}
-	}
-
-	pQuery := make(map[string]prometheus.Summary)
-	for _, fieldType := range fieldTypes {
-		pQuery[fieldType] = prometheus.NewSummary(prometheus.SummaryOpts{
-			Name:        "query",
-			Help:        "Count of executed queries",
-			Objectives:  map[float64]float64{0.5: 0.05, 0.9: 0.01, 0.99: 0.001},
-			ConstLabels: prometheus.Labels{"table": fmt.Sprintf("tbl_%s", fieldType)},
-		})
-	}
+	pQuery := prometheus.NewSummary(prometheus.SummaryOpts{
+		Name:       "query",
+		Help:       "Count of executed queries",
+		Objectives: map[float64]float64{0.5: 0.05, 0.9: 0.01, 0.99: 0.001},
+	})
 
 	for i := 0; i < iterations; i++ {
-		r.Shuffle(len(fieldTypes), func(i, j int) {
-			fieldTypes[i], fieldTypes[j] = fieldTypes[j], fieldTypes[i]
-		})
-
-		for _, fieldType := range fieldTypes {
-			tblName, err := prepTable(db, fieldType)
-			if err != nil {
-				return errors.Wrapf(err, "fail on iteration #%d", i)
-			}
-
-			pq := pQuery[fieldType]
-			err = dbinsert(db, i, tblName, dataRaw, &pq)
-			if err != nil {
-				return errors.Wrapf(err, "fail on iteration #%d", i)
-			}
-
-			pTableSize := prometheus.NewGauge(prometheus.GaugeOpts{
-				Name:        "table_size",
-				Help:        "Table size after inserting data",
-				ConstLabels: prometheus.Labels{"table": tblName, "i": strconv.Itoa(i)},
-			})
-			ts, err := tableSize(db, tblName)
-			if err != nil {
-				return errors.Wrapf(err, "fail to get table size on iteration #%d", i)
-			}
-			pTableSize.Set(float64(ts))
-			p.Collector(pTableSize)
+		err = dbinsert(client, i, dataArrAny, &pQuery, db, dist)
+		if err != nil {
+			return errors.Wrapf(err, "fail on iteration #%d", i)
 		}
 	}
 
-	for _, v := range pQuery {
-		p.Collector(v)
-	}
+	p.Collector(pQuery)
 
 	pFinishedAt.SetToCurrentTime()
 	p.Collector(pFinishedAt)
@@ -114,83 +80,81 @@ func insert(db *sql.DB, tbls ...string) (err error) {
 	grafanaBaseURL := "http://localhost:3000"
 	queryDashboard := "b3a7d255-4083-4a5a-80be-da20613ccd60/postgresql-benchmark-load"
 
-	var tableParams string
-	for _, t := range tbls {
-		tableParams += "&var-table=tbl_" + t
-	}
-
-	murl := fmt.Sprintf("%s/d/%s?orgId=1&var-job=insert&var-run_ts=%s%s", grafanaBaseURL, queryDashboard, runTS, tableParams)
+	murl := fmt.Sprintf("%s/d/%s?orgId=1&var-job=insert&var-run_ts=%s", grafanaBaseURL, queryDashboard, runTS)
 	fmt.Printf("metrics are available on: %s\n", murl)
 
 	return nil
 }
 
-func singleInsertNoMetrics(db *sql.DB, tbls ...string) (err error) {
-	_, dataRaw, _, err := loadJsonDataFromDisk()
-	if err != nil {
-		return err
-	}
-
-	for _, fieldType := range fieldTypes {
-		if len(tbls) > 0 && !slices.Contains(tbls, fieldType) {
-			continue
-		}
-
-		tblName, err := prepTable(db, fieldType)
-		if err != nil {
-			return err
-		}
-
-		err = dbinsert(db, 0, tblName, dataRaw, nil)
-		if err != nil {
-			return err
-		}
-	}
-
-	return
-}
-
-func loadJsonDataFromDisk() (bdata []byte, dataRaw []json.RawMessage, dataParsed []map[string]any, err error) {
+func loadJsonDataFromDisk() (bdata []byte, dataRaw []json.RawMessage, dataParsed []map[string]any, dataArrAny []any, err error) {
 	bdata, err = data.ReadFile(recordsPath)
 	if err != nil {
-		return nil, nil, nil, errors.Wrapf(err, "fail to read records %s", recordsPath)
+		return nil, nil, nil, nil, errors.Wrapf(err, "fail to read records %s", recordsPath)
 	}
 
 	err = json.Unmarshal(bdata, &dataRaw)
 	if err != nil {
-		return nil, nil, nil, errors.Wrap(err, "fail to decode dataset into slice of raw json")
+		return nil, nil, nil, nil, errors.Wrap(err, "fail to decode dataset into slice of raw json")
 	}
 
 	err = json.Unmarshal(bdata, &dataParsed)
 	if err != nil {
-		return nil, nil, nil, errors.Wrap(err, "fail to decode dataset into slice of maps")
+		return nil, nil, nil, nil, errors.Wrap(err, "fail to decode dataset into slice of maps")
 	}
 
-	return bdata, dataRaw, dataParsed, nil
+	dataArrAny = make([]any, len(dataParsed))
+	for i := range dataParsed {
+		dataArrAny[i] = dataParsed[i]
+	}
+
+	return bdata, dataRaw, dataParsed, dataArrAny, nil
 }
 
-func dbinsert(db *sql.DB, i int, tblName string, dataRaw []json.RawMessage, pQuery *prometheus.Summary) (err error) {
+func dbinsert(client *mongo.Client, i int, data []any, pQuery *prometheus.Summary, db *sql.DB, dist bool) (err error) {
 	var (
 		qc               int
 		qd, qdmax, qdmin time.Duration
 	)
 
-	tmplInsert := "INSERT INTO %s(data) VALUES %s"
-	q := fmt.Sprintf(tmplInsert, tblName, values(batch))
+	coll := client.Database("ferretdb").Collection("test-collection")
 
-	for i := 0; i < len(dataRaw); i += batch {
+	if dist {
+		err = DropDistributeTable(db, coll)
+		if err != nil && !strings.Contains(err.Error(), "does not exist") {
+			return
+		}
+	}
+
+	err = coll.Drop(context.TODO())
+	if err != nil {
+		return err
+	}
+
+	coll = client.Database("ferretdb").Collection("test-collection")
+
+	if dist {
+		err = DistributeTable(db, coll)
+		if err != nil {
+			return
+		}
+	}
+
+	for i := 0; i < len(data); i += batch {
+		fmt.Print(".")
+
 		j := i + batch
-		if j > len(dataRaw) {
+		if j > len(data) {
 			break
 		}
 
-		b := make([]interface{}, len(dataRaw[i:j]))
-		for k := range dataRaw[i:j] {
-			b[k] = dataRaw[i:j][k]
+		b := make([]interface{}, len(data[i:j]))
+		for k := range data[i:j] {
+			b[k] = data[i:j][k]
 		}
 
 		begin := time.Now()
-		_, err = db.Exec(q, b...)
+
+		_, err = coll.InsertMany(context.TODO(), data[i:j])
 		if err != nil {
 			err = errors.Wrapf(err, "fail to insert records from %d:%d", i, j)
 			return
@@ -215,7 +179,7 @@ func dbinsert(db *sql.DB, i int, tblName string, dataRaw []json.RawMessage, pQue
 		}
 	}
 
-	fmt.Printf("insert: %s\n", tblName)
+	fmt.Printf("\n")
 	fmt.Printf("count: %v\n", qc)
 	fmt.Printf("duration: %v\n", qd)
 	fmt.Printf("min: %v, avg: %v, max: %v\n", qdmin, qd/time.Duration(qc), qdmax)
@@ -242,10 +206,5 @@ func prepTable(db *sql.DB, fieldType string) (tblName string, err error) {
 		return
 	}
 
-	return
-}
-
-func tableSize(db *sql.DB, tableName string) (size int, err error) {
-	err = db.QueryRow(fmt.Sprintf("select pg_total_relation_size('%s')", tableName)).Scan(&size)
 	return
 }
